@@ -163,6 +163,3 @@ shared-secrets:
   serviceAccount:
     create: false
     name: {{ .Settings.ManagerServiceAccount }}
-  securityContext:
-    runAsUser: ''
-    fsGroup: ''
