@@ -1,0 +1,19 @@
+---
+apiVersion: apps.gitlab.com/v1beta1
+kind: GitLab
+metadata:
+  name: gitlab
+spec:
+  chart:
+    version: CHART_VERSION
+    values:
+      certmanager:
+        install: false
+      global:
+        hosts:
+          domain: DOMAIN
+          hostSuffix: HOSTSUFFIX
+        ingress:
+          configureCertmanager: false
+          tls:
+            secretName: TLSSECRETNAME

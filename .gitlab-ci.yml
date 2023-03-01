@@ -1,0 +1,666 @@
+image: registry.gitlab.com/gitlab-org/gitlab-build-images:gitlab-operator-build-base-golang-1.18
+
+variables:
+  # Configuration of K8s
+  # Namespace within which to run tests
+  TESTS_NAMESPACE: "${CI_COMMIT_SHORT_SHA}-${CI_COMMIT_REF_SLUG}"
+  BUILD_DIR: ".build"
+  INSTALL_DIR: ".install"
+  DOMAIN_OPENSHIFT_4_8: "apps.ocp-ci-4821.k8s-ft.win"
+  DOMAIN_OPENSHIFT_4_9: "apps.ocp-ci-4917.k8s-ft.win"
+  DOMAIN_GKE: "gitlab-operator.k8s-ft.win"
+  DOMAIN_GKE122: "gitlab-operator-v122.k8s-ft.win"
+  # Namespace built into default manifest
+  NAMESPACE: "gitlab-system"
+  TAG: ${CI_COMMIT_SHORT_SHA}
+  HOSTSUFFIX: "${CI_COMMIT_SHORT_SHA}-${CI_COMMIT_REF_SLUG}"
+  TLSSECRETNAME: "gitlab-ci-tls"
+  # docker configuration
+  DOCKER_DRIVER: overlay2
+  DOCKER_HOST: tcp://docker:2375
+  # API endpoint: /projects/:id/packages/generic/:package_name/:package_version
+  RELEASE_VERSION: "${CI_COMMIT_TAG}"
+  HELM_PACKAGE_URL: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/helm/api/stable/charts"
+  K8S_MANIFEST_URL: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/gitlab-operator/${CI_COMMIT_TAG}/gitlab-operator-kubernetes-${CI_COMMIT_TAG}.yaml"
+  OCP_MANIFEST_URL: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/gitlab-operator/${CI_COMMIT_TAG}/gitlab-operator-openshift-${CI_COMMIT_TAG}.yaml"
+  # OCP_RESOURCES_URL: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/gitlab-operator/${CI_COMMIT_TAG}/openshift-resources-${CI_COMMIT_TAG}.yaml"
+  PACKAGE_REGISTRY_URL: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/gitlab-operator/${CI_COMMIT_TAG}"
+  ISSUE_BOT_LABELS_EXTRA: "group::distribution"
+  GO_VERSION: "1.18"
+
+stages:
+  - check
+  - prepare
+  - build
+  - test
+  - publish
+  - release
+  - certification
+  - cluster_tests_approval
+  - review
+  - qa
+  - cleanup
+  - report
+  - followup
+
+workflow:
+  rules:
+    # Avoid duplicate pipeline when an MR is open
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"'
+      when: never
+    # Support Merge Request pipelines
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME'
+    # Run regular pipelines on pushes to branches that does not have an MR open
+    - if: '$CI_COMMIT_BRANCH'
+    # Run pipelines on tag pushes
+    - if: '$CI_COMMIT_TAG'
+
+include:
+  - template: Jobs/Dependency-Scanning.latest.gitlab-ci.yml
+    rules:
+      - if: '$CI_PROJECT_PATH == "gitlab-org/cloud-native/gitlab-operator"'
+  - template: Jobs/Secret-Detection.latest.gitlab-ci.yml
+    rules:
+      - if: '$CI_PROJECT_PATH == "gitlab-org/cloud-native/gitlab-operator"'
+  - local: .gitlab-ci-templates.yml
+
+default:
+  interruptible: true
+
+danger-review:
+  stage: check
+  image: 'ruby:3.0'
+  needs: []
+  retry:
+    max: 2
+    when:
+      - unknown_failure
+      - api_failure
+      - runner_system_failure
+      - stuck_or_timeout_failure
+  before_script:
+    - bundle install --with 'danger'
+  script:
+    - >
+      if [ -z "$DANGER_GITLAB_API_TOKEN" ]; then
+        # Force danger to skip CI source GitLab and fallback to "local only git repo".
+        unset GITLAB_CI
+        # We need to base SHA to help danger determine the base commit for this shallow clone.
+        bundle exec danger dry_run --fail-on-errors=true --verbose --base='$CI_MERGE_REQUEST_DIFF_BASE_SHA' --head='${CI_MERGE_REQUEST_SOURCE_BRANCH_SHA:-$CI_COMMIT_SHA}'
+      else
+        danger_id=$(echo -n ${DANGER_GITLAB_API_TOKEN} | md5sum | awk '{print $1}' | cut -c5-10)
+        bundle exec danger --fail-on-errors=true --verbose --danger_id=${danger_id}
+      fi
+  rules:
+    - !reference [.skip_if_dev_mirror]
+    - !reference [.skip_if_release_tag]
+    - !reference [.skip_if_default_branch]
+    - !reference [.skip_if_stable_branch]
+    - if: '($CI_COMMIT_BRANCH || $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME) && $CI_PROJECT_PATH == "gitlab-org/cloud-native/gitlab-operator"'
+
+pull_charts:
+  stage: prepare
+  script: scripts/retrieve_gitlab_charts.sh
+  artifacts:
+    paths:
+      - charts/
+  rules:
+    - !reference [.skip_if_docs_branch]
+    - !reference [.if_release_tag]
+    - !reference [.if_commit_branch_or_mr_branch]
+  needs:
+    - job: danger-review
+      optional: true
+
+lint_code:
+  extends: .cache
+  stage: test
+  image: registry.gitlab.com/gitlab-org/gitlab-build-images:golangci-lint-1.50-alpine
+  script: golangci-lint run --out-format code-climate | tee gl-code-quality-report.json | jq -r '.[] | "\(.location.path):\(.location.lines.begin) \(.description)"'
+  artifacts:
+    reports:
+      codequality: gl-code-quality-report.json
+    paths:
+      - gl-code-quality-report.json
+  rules:
+    - !reference [.skip_if_dev_mirror]
+    - !reference [.skip_if_release_tag]
+    - !reference [.skip_if_docs_branch]
+    - !reference [.if_commit_branch_or_mr_branch]
+  needs:
+    - job: danger-review
+      optional: true
+
+docs-lint links:
+  image: registry.gitlab.com/gitlab-org/gitlab-docs/lint-html:alpine-3.16-ruby-3.0.5-2a7e4d1c
+  stage: test
+  needs:
+    - job: danger-review
+      optional: true
+  script:
+    # Prepare docs for build
+    # The path must be 'operator/' because we have hardcoded links relying on it
+    - mv doc/ /tmp/gitlab-docs/content/operator
+    - cd /tmp/gitlab-docs
+    # Build HTML from Markdown
+    - bundle exec nanoc
+    # Check the internal links and anchors (in parallel)
+    - "parallel time bundle exec nanoc check ::: internal_links internal_anchors"
+
+lint_docs_markdown:
+  stage: test
+  image: registry.gitlab.com/gitlab-org/gitlab-docs/lint-markdown:alpine-3.16-vale-2.23.0-markdownlint-0.33.0-markdownlint2-0.6.0
+  cache: {}
+  needs:
+    - job: danger-review
+      optional: true
+  before_script: []
+  dependencies: []
+  script:
+    # Lint prose
+    - vale --minAlertLevel error --output=doc/.vale/vale.tmpl doc
+    # Lint Markdown
+    - markdownlint-cli2-config .markdownlint.yml 'doc/**/*.md'
+  rules:
+    - !reference [.skip_if_dev_mirror]
+    - !reference [.skip_if_release_tag]
+    - !reference [.if_commit_branch_or_mr_branch]
+
+.test_job:
+  extends: .cache
+  stage: test
+  needs:
+    - job: pull_charts
+    - job: danger-review
+      optional: true
+  variables:
+    HELM_CHARTS: "${CI_PROJECT_DIR}/charts"
+    KUBECONFIG: "" # to ensure that the CI cluster is not used
+    USE_EXISTING_CLUSTER: "false" # to ensure we don't use the $KUBECONFIG value
+    KUBEBUILDER_ASSETS: "/usr/local/kubebuilder/bin"
+  before_script:
+    - mkdir coverage
+    - export CHART_VERSION=$(sed -n ${VERSION_INDEX}p CHART_VERSIONS)
+    - echo "Testing with chart version ${CHART_VERSION}"
+  rules:
+    - !reference [.skip_if_release_tag]
+    - !reference [.skip_if_docs_branch]
+    - !reference [.if_commit_branch_or_mr_branch]
+
+unit_tests:
+  extends: .test_job
+  script: TEST_UTIL=ginkgo2 task unit-tests
+  parallel:
+    matrix:
+      - VERSION_INDEX: ["1", "2", "3"]
+
+slow_unit_tests:
+  extends: .test_job
+  script: TEST_UTIL=ginkgo2 task slow-unit-tests
+  parallel:
+    matrix:
+      - VERSION_INDEX: ["1", "2", "3"]
+
+.docker_build_job:
+  extends: .cache
+  stage: release
+  needs: ["pull_charts"]
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u "${CI_REGISTRY_USER}" -p "${CI_REGISTRY_PASSWORD}" "${CI_REGISTRY}"
+    # Update module cache so it can be saved in CI cache (only the dependencies required to build)
+    - docker run -v "${GOPATH}:/go" -v "${CI_PROJECT_DIR}:/code" -w /code golang:${GO_VERSION} go list ./...
+  interruptible: false
+
+.podman_build_job:
+  extends: .cache
+  stage: release
+  needs: ["pull_charts"]
+  before_script:
+    - sed -i 's#^driver.*$#driver = "vfs"#g' /etc/containers/storage.conf
+    - podman login -u "${CI_REGISTRY_USER}" -p "${CI_REGISTRY_PASSWORD}" "${CI_REGISTRY}"
+    # Update module cache so it can be saved in CI cache (only the dependencies required to build)
+    - mkdir -p .go
+    - podman run -v "${GOPATH}:/go" -v "${CI_PROJECT_DIR}:/code" -w /code golang:${GO_VERSION} go list ./...
+  interruptible: false
+
+build_branch_image:
+  extends: .docker_build_job
+  script:
+    - docker build -t "${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}" -t "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}" .
+    - docker push "${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}"
+    - docker push "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+  rules:
+    - !reference [.skip_if_docs_branch]
+    - !reference [.skip_if_default_branch]
+    - !reference [.skip_if_release_tag]
+    - !reference [.if_commit_branch_or_mr_branch]
+
+build_tag_image:
+  extends: .docker_build_job
+  script:
+    - docker build -t "${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG}" -t "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}" .
+    - docker push "${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG}"
+    - docker push "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+  rules:
+    - !reference [.if_release_tag]
+    # TODO: when dev is part of the official release process,
+    # change this to:
+    # - !reference [.if_release_tag_on_dev]
+  needs:
+    - !reference [.docker_build_job, needs]
+    - upload_manifest
+
+build_latest_image:
+  extends: .docker_build_job
+  script:
+    - docker build -t "${CI_REGISTRY_IMAGE}:${CI_DEFAULT_BRANCH}" -t "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}" -t "${CI_REGISTRY_IMAGE}:latest" .
+    - docker push "${CI_REGISTRY_IMAGE}:${CI_DEFAULT_BRANCH}"
+    - docker push "${CI_REGISTRY_IMAGE}:latest"
+    - docker push "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+  rules:
+    - !reference [.if_default_branch]
+
+build_bundle_image:
+  extends: .podman_build_job
+  variables:
+    BUNDLE_REGISTRY: ${CI_REGISTRY_IMAGE}/bundle
+    COMPILE_ONLY: "false"
+    DOCKER: "podman"
+    OPM_DOCKER: "podman"
+    OLM_PACKAGE_NAME: "gitlab-operator-kubernetes"
+  script:
+    - export OLM_PACKAGE_VERSION=${CI_COMMIT_TAG:-${TAG}}
+    - export OPERATOR_TAG=${CI_COMMIT_TAG:-${TAG}}
+    - export TAG=${CI_COMMIT_TAG:-${TAG}}
+    - export BUNDLE_IMAGE_TAG=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}
+    - scripts/olm_bundle.sh publish
+  rules:
+    - !reference [.if_release_tag]
+
+approve_cluster_tests:
+  stage: cluster_tests_approval
+  image: alpine:latest
+  script: echo "Proceeding to tests in CI clusters..."
+  rules:
+    - !reference [.skip_if_docs_branch]
+    - !reference [.skip_if_release_tag]
+    - !reference [.skip_if_stable_branch]
+    - !reference [.skip_if_default_branch]
+    - !reference [.manual_if_commit_branch_or_mr_branch]
+  needs:
+    - job: danger-review
+      optional: true
+
+build_review_4_8:
+  extends: .build_review_template
+  variables:
+    DOMAIN: $DOMAIN_OPENSHIFT_4_8
+    PLATFORM: openshift
+
+create_review_4_8:
+  extends: .create_review_template
+  environment: &environment_4_8
+    name: &env_4_8_name openshift_4_8/$CI_COMMIT_SHORT_SHA-$CI_COMMIT_REF_SLUG
+    url: https://gitlab-$TESTS_NAMESPACE.$DOMAIN_OPENSHIFT_4_8
+    on_stop: stop_review_openshift_4_8
+    auto_stop_in: 1 hour
+  needs:
+    - build_review_4_8
+
+review_4_8:
+  extends: .review_template
+  variables:
+    DOMAIN: $DOMAIN_OPENSHIFT_4_8
+    PLATFORM: openshift
+  before_script:
+    - export KUBECONFIG="$KUBECONFIG_OCP_4_8"
+  needs:
+    - create_review_4_8
+    # we need build_* dependency to receive appropriate artifacts
+    - build_review_4_8
+  environment: *environment_4_8
+  resource_group: *env_4_8_name
+
+build_review_4_9:
+  extends: .build_review_template
+  variables:
+    DOMAIN: $DOMAIN_OPENSHIFT_4_9
+    PLATFORM: openshift
+
+create_review_4_9:
+  extends: .create_review_template
+  environment: &environment_4_9
+    name: &env_4_9_name openshift_4_9/$CI_COMMIT_SHORT_SHA-$CI_COMMIT_REF_SLUG
+    url: https://gitlab-$TESTS_NAMESPACE.$DOMAIN_OPENSHIFT_4_9
+    on_stop: stop_review_openshift_4_9
+    auto_stop_in: 1 hour
+  needs:
+    - build_review_4_9
+
+review_4_9:
+  extends: .review_template
+  variables:
+    DOMAIN: $DOMAIN_OPENSHIFT_4_9
+    PLATFORM: openshift
+  before_script:
+    - export KUBECONFIG="$KUBECONFIG_OCP_4_9"
+  needs:
+    - create_review_4_9
+    # we need build_* dependency to receive appropriate artifacts
+    - build_review_4_9
+  environment: *environment_4_9
+  resource_group: *env_4_9_name
+
+build_review_gke:
+  extends: .build_review_template
+  variables:
+    DOMAIN: $DOMAIN_GKE
+    PLATFORM: kubernetes
+
+create_review_gke:
+  extends: .create_review_template
+  environment: &environment_gke
+    name: &env_gke_name gke/$CI_COMMIT_SHORT_SHA-$CI_COMMIT_REF_SLUG
+    url: https://gitlab-$TESTS_NAMESPACE.$DOMAIN_GKE
+    on_stop: stop_review_gke
+    auto_stop_in: 1 hour
+  needs:
+    - build_review_gke
+
+review_gke:
+  extends: .review_template
+  variables:
+    DOMAIN: $DOMAIN_GKE
+    PLATFORM: kubernetes
+  before_script:
+    - export KUBECONFIG="$KUBECONFIG_GKE"
+  needs:
+    - create_review_gke
+    # we need build_* dependency to receive appropriate artifacts
+    - build_review_gke
+  environment: *environment_gke
+  resource_group: *env_gke_name
+
+build_review_gke122:
+  extends: .build_review_template
+  variables:
+    DOMAIN: $DOMAIN_GKE122
+    PLATFORM: kubernetes
+
+create_review_gke122:
+  extends: .create_review_template
+  environment: &environment_gke122
+    name: &env_gke_name122 gke122/$CI_COMMIT_SHORT_SHA-$CI_COMMIT_REF_SLUG
+    url: https://gitlab-$TESTS_NAMESPACE.$DOMAIN_GKE122
+    on_stop: stop_review_gke122
+    auto_stop_in: 1 hour
+  needs:
+    - build_review_gke122
+
+review_gke122:
+  extends: .review_template
+  variables:
+    DOMAIN: $DOMAIN_GKE122
+    PLATFORM: kubernetes
+  before_script:
+    - export KUBECONFIG="$KUBECONFIG_GKE122"
+  needs:
+    - create_review_gke122
+    # we need build_* dependency to receive appropriate artifacts
+    - build_review_gke122
+  environment: *environment_gke122
+  resource_group: *env_gke_name122
+
+qa_4_8:
+  extends: .qa
+  stage: qa
+  variables:
+    DOMAIN: $DOMAIN_OPENSHIFT_4_8
+  needs:
+    - review_4_8
+
+qa_4_9:
+  extends: .qa
+  stage: qa
+  variables:
+    DOMAIN: $DOMAIN_OPENSHIFT_4_9
+  needs:
+    - review_4_9
+
+qa_gke:
+  extends: .qa
+  stage: qa
+  variables:
+    DOMAIN: $DOMAIN_GKE
+  needs:
+    - review_gke
+
+qa_gke122:
+  extends: .qa
+  stage: qa
+  variables:
+    DOMAIN: $DOMAIN_GKE122
+  needs:
+    - review_gke122
+
+stop_review_openshift_4_8:
+  extends: .stop_review_template
+  variables:
+    DOMAIN: $DOMAIN_OPENSHIFT_4_8
+  before_script:
+    - export KUBECONFIG="$KUBECONFIG_OCP_4_8"
+  environment:
+    name: openshift_4_8/$CI_COMMIT_SHORT_SHA-$CI_COMMIT_REF_SLUG
+    action: stop
+  needs:
+    - build_review_4_8
+
+stop_review_openshift_4_9:
+  extends: .stop_review_template
+  variables:
+    DOMAIN: $DOMAIN_OPENSHIFT_4_9
+  before_script:
+    - export KUBECONFIG="$KUBECONFIG_OCP_4_9"
+  environment:
+    name: openshift_4_9/$CI_COMMIT_SHORT_SHA-$CI_COMMIT_REF_SLUG
+    action: stop
+  needs:
+    - build_review_4_9
+
+stop_review_gke:
+  extends: .stop_review_template
+  variables:
+    DOMAIN: $DOMAIN_GKE
+  before_script:
+    - export KUBECONFIG="$KUBECONFIG_GKE"
+  environment:
+    name: gke/$CI_COMMIT_SHORT_SHA-$CI_COMMIT_REF_SLUG
+    action: stop
+  needs:
+    - build_review_gke
+
+stop_review_gke122:
+  extends: .stop_review_template
+  variables:
+    DOMAIN: $DOMAIN_GKE122
+  before_script:
+    - export KUBECONFIG="$KUBECONFIG_GKE122"
+  environment:
+    name: *env_gke_name122
+    action: stop
+  needs:
+    - build_review_gke122
+
+image_certification:
+  stage: certification
+  variables:
+    DOCKER_AUTH_FILE: /run/containers/0/auth.json
+    REGISTRY_USER: $RH_CERTIFICATION_REGISTRY_USER
+    REGISTRY_PASSWORD: $RH_CERTIFICATION_REGISTRY_PASSWORD 
+    COMPONENT_NAME: gitlab-operator
+  image: registry.gitlab.com/gitlab-org/cloud-native/preflight:1.2.1
+  retry: 1
+  allow_failure: true
+  before_script:
+    - REGISTRY_USER=${REGISTRY_USER:-${CI_REGISTRY_USER:-unused}}
+    - REGISTRY_PASSWORD=${REGISTRY_PASSWORD:-$CI_REGISTRY_PASSWORD}
+    - podman login -u ${REGISTRY_USER} -p ${REGISTRY_PASSWORD} ${CI_REGISTRY}
+    - '[[ -d reports ]] || mkdir reports'
+  script:
+    - CERTIFY_TAG=${CI_COMMIT_SHORT_SHA}
+    - SUBMIT=""
+    - REDHAT_PROJECT_ID=${REDHAT_PROJECT_ID:-$(yq eval ".${COMPONENT_NAME}.ospid" redhat-projects.yaml)}
+    - |
+      if [ -n "$REDHAT_PROJECT_ID" -a -n "$REDHAT_API_TOKEN" -a -n "${CI_COMMIT_TAG}" ] ; then 
+        echo "Image will be submitted to RedHat for Certification"
+        SUBMIT="--submit"
+        export PFLT_PYXIS_API_TOKEN="${REDHAT_API_TOKEN}"
+        export PFLT_CERTIFICATION_PROJECT_ID="${REDHAT_PROJECT_ID}"
+        CERTIFY_TAG=${CI_COMMIT_TAG:-${CERTIFY_TAG}}
+      fi
+    - CERTIFY_IMAGE="${CI_REGISTRY_IMAGE}:${CERTIFY_TAG}"
+    - echo "Running preflight certification check for ${CERTIFY_IMAGE}"
+    - preflight check container ${CERTIFY_IMAGE} ${SUBMIT} --docker-config="${DOCKER_AUTH_FILE}" > reports/${COMPONENT_NAME}-cert.json
+    - test "$(jq .passed reports/${COMPONENT_NAME}-cert.json)" == 'true' 
+  artifacts:
+    untracked: false
+    paths:
+      - reports/*
+  rules:
+    - !reference [.skip_if_docs_branch]
+    - !reference [.if_release_tag]
+    - !reference [.if_redhat_certification]
+    - !reference [.if_commit_branch_or_mr_branch]
+
+build_chart:
+  stage: build
+  script:
+    - helm dependency build deploy/chart
+    - helm package deploy/chart -d .build/
+  artifacts:
+    untracked: false
+    expire_in: 30 days
+    paths:
+      - ".build/gitlab-operator-*.tgz"
+  rules:
+    - !reference [.skip_if_docs_branch]
+    - !reference [.if_release_tag]
+    - !reference [.if_commit_branch_or_mr_branch]
+
+upload_chart:
+  stage: publish
+  image: curlimages/curl:latest
+  needs:
+    - build_chart
+  rules:
+    - !reference [.if_release_tag_on_dev]
+    - !reference [.manual_if_release_tag]
+  script:
+    - set -- .build/gitlab-operator-*.tgz
+    - |
+      curl --request POST \
+        --user "gitlab-ci-token:${CI_JOB_TOKEN}" \
+        --form "chart=@$1" \
+        ${HELM_PACKAGE_URL}
+
+build_manifest:
+  stage: build
+  script:
+    - export TAG=${CI_COMMIT_TAG:-${TAG}}
+    - task build_operator
+    - task build_operator_openshift
+  artifacts:
+    untracked: false
+    expire_in: 30 days
+    paths:
+      - ${BUILD_DIR}/operator.yaml
+      - ${BUILD_DIR}/operator-openshift.yaml
+  rules:
+    - !reference [.skip_if_docs_branch]
+    - !reference [.if_release_tag]
+    - !reference [.if_commit_branch_or_mr_branch]
+
+upload_manifest:
+  stage: publish
+  image: curlimages/curl:latest
+  needs:
+    - build_manifest
+  rules:
+    - !reference [.if_release_tag_on_dev]
+    - !reference [.manual_if_release_tag]
+  script:
+    - |
+      curl --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        --upload-file ${BUILD_DIR}/operator.yaml \
+        ${K8S_MANIFEST_URL}?status=default
+    - |
+      curl --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+        --upload-file ${BUILD_DIR}/operator-openshift.yaml \
+        ${OCP_MANIFEST_URL}?status=default
+
+publish_release:
+  # Caution, as of 2021-02-02 these assets links require a login, see:
+  # https://gitlab.com/gitlab-org/gitlab/-/issues/299384
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - upload_manifest
+  rules:
+    - !reference [.if_release_tag]
+  script: echo "Releasing $CI_COMMIT_TAG from ${K8S_MANIFEST_URL} and ${OCP_MANIFEST_URL}"
+  release:
+    name: "Release $CI_COMMIT_TAG"
+    tag_name: "$CI_COMMIT_TAG"
+    description: "$CI_COMMIT_TAG"
+    assets:
+      links:
+        - name: "gitlab-operator-kubernetes.yaml"
+          url: "${K8S_MANIFEST_URL}"
+        - name: "gitlab-operator-openshift.yaml"
+          url: "${OCP_MANIFEST_URL}"
+#         - name: "openshift-resources.yaml"
+#           url: "${OCP_RESOURCES_URL}"
+
+trigger-public-release:
+  stage: release
+  image: "registry.gitlab.com/gitlab-org/gitlab-build-images:alpine-bash-jq-curl-git"
+  variables:
+    COM_API_OPERATOR_PROJECT_URL: "https://gitlab.com/api/v4/projects/18899486"
+  script:
+    - pipeline_id=$(curl -fS "${COM_API_OPERATOR_PROJECT_URL}/pipelines?ref=${CI_COMMIT_TAG}" | jq '.[0].id')
+    - upload_manifest_job_id=$(curl -fS "${COM_API_OPERATOR_PROJECT_URL}/pipelines/${pipeline_id}/jobs" | jq '.[] | select(.name=="upload_manifest").id')
+    - curl -fS --request POST --header "PRIVATE-TOKEN:${COM_OPERATOR_PROJECT_ACCESS_TOKEN}" "${COM_API_OPERATOR_PROJECT_URL}/jobs/${upload_manifest_job_id}/play"
+    - upload_chart_job_id=$(curl -fS "${COM_API_OPERATOR_PROJECT_URL}/pipelines/${pipeline_id}/jobs" | jq '.[] | select(.name=="upload_chart").id')
+    - curl -fS --request POST --header "PRIVATE-TOKEN:${COM_OPERATOR_PROJECT_ACCESS_TOKEN}" "${COM_API_OPERATOR_PROJECT_URL}/jobs/${upload_chart_job_id}/play"
+  rules:
+    - !reference [.delayed_if_release_tag_on_dev]
+
+issue-bot:
+  stage: report
+  image: registry.gitlab.com/gitlab-org/distribution/issue-bot:latest
+  script: /issue-bot
+  rules:
+    - if: $ISSUE_BOT_API_TOKEN == null
+      when: never
+    - !reference [.on_failure_if_release_tag]
+    - !reference [.on_failure_if_stable_branch]
+    - !reference [.on_failure_if_default_branch]
+
+create_followup_issue:
+  stage: followup
+  image: curlimages/curl:latest
+  allow_failure: true
+  script:
+    - content=$(sed -e "s/X.Y.Z/${CI_COMMIT_TAG}/g" .gitlab/issue_templates/release.md)
+    - title="Publish Operator ${CI_COMMIT_TAG}"
+    - |
+      curl -H "PRIVATE-TOKEN: ${OPERATOR_RELEASE_ISSUE_TOKEN}" -X POST \
+           -d "title=${title}" -d "description=${content}" \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/issues"
+  rules:
+    - !reference [.if_release_tag_on_canonical]
+  needs:
+    - publish_release
